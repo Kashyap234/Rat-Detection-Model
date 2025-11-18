@@ -44,14 +44,13 @@ def load_model():
         from models.experimental import attempt_load
         
         device = torch.device('cpu')
-        # --- FIX 2: RENAMED MODEL FILE REFERENCE ---
-        # Make sure you rename 'best (1).pt' to 'best.pt' in your repo!
+        # --- FIX 2: ROBUST FILENAME CHECK ---
+        # Checks for 'best.pt' first, then falls back to 'best (1).pt'
         model_path = 'best.pt' 
-        
-        # Fallback check if user didn't rename it
         if not os.path.exists(model_path) and os.path.exists('best (1).pt'):
             model_path = 'best (1).pt'
 
+        # Load model
         model = attempt_load(model_path, device=device, fuse=False)
         model.eval()
         
@@ -65,22 +64,27 @@ def load_model():
         return True
         
     except Exception as e:
+        # Detailed error logging
         model_info = {
             'loaded': False,
             'error': str(e),
             'traceback': traceback.format_exc()
         }
         print(f"✗ Model loading failed: {e}")
+        print(traceback.format_exc())
         return False
 
-# --- FIX 3: LOAD MODEL IMMEDIATELY FOR GUNICORN ---
+# --- FIX 3: LOAD MODEL IMMEDIATELY ---
+# This ensures Gunicorn loads the model when the worker starts
 print("Loading model during startup...")
 load_model()
 
 def process_image(image_path):
     """Process image and run detection"""
     if model is None:
-        return {'success': False, 'error': 'Model not loaded'}
+        # Try loading one more time if it failed initially
+        if not load_model():
+            return {'success': False, 'error': 'Model failed to load. Check server logs.'}
         
     try:
         from utils.general import non_max_suppression, scale_boxes

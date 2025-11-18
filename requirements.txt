@@ -12,3 +12,4 @@ pandas==2.0.3
 scipy==1.11.3
 Werkzeug==3.0.1
 gunicorn==21.2.0
+ultralytics
