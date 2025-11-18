@@ -11,9 +11,13 @@ import base64
 from io import BytesIO
 import traceback
 import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # --- FIX 1: CROSS-PLATFORM MODEL LOADING ---
-# This allows a model trained on Windows to run on Linux (Render)
 plat = platform.system()
 if plat == 'Linux':
     pathlib.WindowsPath = pathlib.PosixPath
@@ -41,16 +45,20 @@ def load_model():
     """Load YOLOv5 model"""
     global model, model_info
     try:
+        logger.info("Starting model load...")
         from models.experimental import attempt_load
         
         device = torch.device('cpu')
-        # --- FIX 2: ROBUST FILENAME CHECK ---
-        # Checks for 'best.pt' first, then falls back to 'best (1).pt'
+        
+        # Check for model file
         model_path = 'best.pt' 
         if not os.path.exists(model_path) and os.path.exists('best (1).pt'):
             model_path = 'best (1).pt'
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        # Load model
+        logger.info(f"Loading model from: {model_path}")
         model = attempt_load(model_path, device=device, fuse=False)
         model.eval()
         
@@ -60,29 +68,30 @@ def load_model():
             'classes': list(model.names.values()) if isinstance(model.names, dict) else model.names,
             'stride': int(model.stride.max()) if hasattr(model, 'stride') else 32
         }
-        print("✓ Model loaded successfully")
+        logger.info("✓ Model loaded successfully")
+        logger.info(f"Classes: {model_info['classes']}")
         return True
         
     except Exception as e:
-        # Detailed error logging
         model_info = {
             'loaded': False,
             'error': str(e),
             'traceback': traceback.format_exc()
         }
-        print(f"✗ Model loading failed: {e}")
-        print(traceback.format_exc())
+        logger.error(f"✗ Model loading failed: {e}")
+        logger.error(traceback.format_exc())
         return False
 
-# --- FIX 3: LOAD MODEL IMMEDIATELY ---
-# This ensures Gunicorn loads the model when the worker starts
-print("Loading model during startup...")
+# Load model during startup
+logger.info("Loading model during startup...")
 load_model()
 
 def process_image(image_path):
     """Process image and run detection"""
+    logger.info(f"Processing image: {image_path}")
+    
     if model is None:
-        # Try loading one more time if it failed initially
+        logger.warning("Model not loaded, attempting to load...")
         if not load_model():
             return {'success': False, 'error': 'Model failed to load. Check server logs.'}
         
@@ -91,14 +100,18 @@ def process_image(image_path):
         from utils.plots import Annotator, colors
         from utils.augmentations import letterbox
         
+        # Load and preprocess image
+        logger.info("Loading image...")
         image = Image.open(image_path)
         img_array = np.array(image)
         
+        # Convert RGBA to RGB if needed
         if img_array.shape[-1] == 4:
             img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
         
         img_original = img_array.copy()
         
+        # Prepare image for model
         stride = model_info.get('stride', 32)
         img = letterbox(img_array, 640, stride=stride, auto=True)[0]
         img = img.transpose((2, 0, 1))[::-1]
@@ -109,14 +122,17 @@ def process_image(image_path):
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
         
+        logger.info("Running inference...")
         with torch.no_grad():
             pred = model(img, augment=False, visualize=False)[0]
         
+        logger.info("Applying NMS...")
         pred = non_max_suppression(pred, 0.25, 0.45, None, False, max_det=1000)
         
         detections = []
         annotator = Annotator(img_original.copy(), line_width=3, example=str(model.names))
         
+        logger.info(f"Processing {len(pred)} prediction(s)...")
         for i, det in enumerate(pred):
             if len(det):
                 det[:, :4] = scale_boxes(img.shape[2:], det[:, :4], img_original.shape).round()
@@ -131,14 +147,23 @@ def process_image(image_path):
                     })
         
         annotated_img = annotator.result()
+        logger.info(f"Detection complete. Found {len(detections)} object(s)")
+        
         return {
             'success': True,
             'detections': detections,
             'num_detections': len(detections),
             'annotated_image': annotated_img
         }
+        
     except Exception as e:
-        return {'success': False, 'error': str(e), 'traceback': traceback.format_exc()}
+        logger.error(f"Error processing image: {e}")
+        logger.error(traceback.format_exc())
+        return {
+            'success': False, 
+            'error': str(e), 
+            'traceback': traceback.format_exc()
+        }
 
 def process_frame(frame):
     """Process a single frame for live detection"""
@@ -192,7 +217,7 @@ def process_frame(frame):
         
         return annotated_frame, detections
     except Exception as e:
-        print(f"Frame processing error: {e}")
+        logger.error(f"Frame processing error: {e}")
         return frame, []
 
 def generate_frames():
@@ -221,11 +246,16 @@ def generate_frames():
             camera.release()
 
 def image_to_base64(img_array):
-    img = Image.fromarray(img_array)
-    buffered = BytesIO()
-    img.save(buffered, format="JPEG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    return f"data:image/jpeg;base64,{img_str}"
+    """Convert numpy array to base64 string"""
+    try:
+        img = Image.fromarray(img_array)
+        buffered = BytesIO()
+        img.save(buffered, format="JPEG", quality=85)
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        return f"data:image/jpeg;base64,{img_str}"
+    except Exception as e:
+        logger.error(f"Error converting image to base64: {e}")
+        raise
 
 @app.route('/')
 def index():
@@ -233,26 +263,44 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-        return jsonify({'error': 'Invalid file type'}), 400
-    
+    """Handle image upload and detection"""
     try:
+        logger.info("Upload request received")
+        
+        # Validate request
+        if 'file' not in request.files:
+            logger.warning("No file in request")
+            return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+            
+        file = request.files['file']
+        
+        if file.filename == '':
+            logger.warning("Empty filename")
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
+            
+        if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            logger.warning(f"Invalid file type: {file.filename}")
+            return jsonify({'success': False, 'error': 'Invalid file type. Use JPG, JPEG, or PNG'}), 400
+        
+        # Save file
         filename = 'uploaded_' + file.filename
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        logger.info(f"Saving file to: {filepath}")
         file.save(filepath)
         
+        # Process image
+        logger.info("Starting image processing...")
         result = process_image(filepath)
         
         if result['success']:
+            logger.info("Processing successful, preparing response...")
+            
+            # Load original image
             original_img = Image.open(filepath)
             original_base64 = image_to_base64(np.array(original_img))
             annotated_base64 = image_to_base64(result['annotated_image'])
-            return jsonify({
+            
+            response_data = {
                 'success': True,
                 'original_image': original_base64,
                 'annotated_image': annotated_base64,
@@ -260,12 +308,25 @@ def upload_file():
                 'num_detections': result['num_detections'],
                 'has_rat': result['num_detections'] > 0,
                 'status': 'UNHYGIENIC' if result['num_detections'] > 0 else 'CLEAR'
-            })
+            }
+            
+            logger.info(f"Response prepared: {result['num_detections']} detections")
+            return jsonify(response_data)
         else:
-            return jsonify({'success': False, 'error': result['error']}), 500
+            logger.error(f"Processing failed: {result.get('error')}")
+            return jsonify({
+                'success': False, 
+                'error': result.get('error', 'Unknown error')
+            }), 500
             
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error(f"Upload endpoint error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False, 
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
 
 @app.route('/video_feed')
 def video_feed():
@@ -285,7 +346,21 @@ def get_model_info():
 
 @app.route('/health')
 def health_check():
-    return jsonify({'status': 'healthy', 'model_loaded': model_info.get('loaded', False)})
+    return jsonify({
+        'status': 'healthy', 
+        'model_loaded': model_info.get('loaded', False),
+        'model_info': model_info
+    })
+
+# Error handlers
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'success': False, 'error': 'File too large. Max size is 16MB'}), 413
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal server error: {e}")
+    return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
